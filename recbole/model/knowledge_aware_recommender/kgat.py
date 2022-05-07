@@ -99,6 +99,19 @@ class KGAT(KnowledgeRecommender):
 
         # generate intermediate data
         self.A_in = self.init_graph()  # init the attention matrix by the structure of ckg
+        self.A_in_1 = self.A_in
+        self.A_in_2 = self.A_in
+        affine = True
+        self.projection_head = torch.nn.ModuleList()
+        inner_size = self.layers[-1] * 2
+        print("inner size:", inner_size)
+        self.projection_head.append(torch.nn.Linear(inner_size, inner_size * 4, bias=False))
+        self.projection_head.append(torch.nn.BatchNorm1d(inner_size * 4, eps=1e-12, affine=affine))
+        self.projection_head.append(torch.nn.Linear(inner_size * 4, inner_size, bias=False))
+        self.projection_head.append(torch.nn.BatchNorm1d(inner_size, eps=1e-12, affine=affine))
+        self.mode = 0
+
+
 
         # define layers and loss
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_size)
@@ -111,6 +124,7 @@ class KGAT(KnowledgeRecommender):
         self.tanh = nn.Tanh()
         self.mf_loss = BPRLoss()
         self.reg_loss = EmbLoss()
+        self.ce_loss = nn.CrossEntropyLoss()
         self.restore_user_e = None
         self.restore_entity_e = None
 
@@ -160,6 +174,38 @@ class KGAT(KnowledgeRecommender):
         user_all_embeddings, entity_all_embeddings = torch.split(kgat_all_embeddings, [self.n_users, self.n_entities])
         return user_all_embeddings, entity_all_embeddings
 
+    def forward_1(self):
+        ego_embeddings = self._get_ego_embeddings()
+        embeddings_list = [ego_embeddings]
+        for aggregator in self.aggregator_layers:
+            ego_embeddings = aggregator(self.A_in_1, ego_embeddings)
+            norm_embeddings = F.normalize(ego_embeddings, p=2, dim=1)
+            embeddings_list.append(norm_embeddings)
+        kgat_all_embeddings = torch.cat(embeddings_list, dim=1)
+        user_all_embeddings, entity_all_embeddings = torch.split(kgat_all_embeddings, [self.n_users, self.n_entities])
+        return user_all_embeddings, entity_all_embeddings
+
+    def forward_2(self):
+        ego_embeddings = self._get_ego_embeddings()
+        embeddings_list = [ego_embeddings]
+        for aggregator in self.aggregator_layers:
+            ego_embeddings = aggregator(self.A_in_2, ego_embeddings)
+            norm_embeddings = F.normalize(ego_embeddings, p=2, dim=1)
+            embeddings_list.append(norm_embeddings)
+        kgat_all_embeddings = torch.cat(embeddings_list, dim=1)
+        user_all_embeddings, entity_all_embeddings = torch.split(kgat_all_embeddings, [self.n_users, self.n_entities])
+        return user_all_embeddings, entity_all_embeddings
+    
+    def mask_correlated_samples(self, batch_size):
+        N = 2 * batch_size
+        mask = torch.ones((N, N), dtype=bool)
+        mask = mask.fill_diagonal_(0)
+        for i in range(batch_size):
+            mask[i, batch_size + i] = 0
+            mask[batch_size + i, i] = 0
+        return mask
+
+
     def _get_kg_embedding(self, h, r, pos_t, neg_t):
         h_e = self.entity_embedding(h).unsqueeze(1)
         pos_t_e = self.entity_embedding(pos_t).unsqueeze(1)
@@ -173,6 +219,40 @@ class KGAT(KnowledgeRecommender):
 
         return h_e, r_e, pos_t_e, neg_t_e
 
+    def cts_loss(self, z_i, z_j, temp, batch_size): #B * D    B * D
+        
+        N = 2 * batch_size
+    
+        z = torch.cat((z_i, z_j), dim=0)   #2B * D  
+    
+        sim = torch.mm(z, z.T) / temp   # 2B * 2B
+    
+        sim_i_j = torch.diag(sim, batch_size)    #B*1
+        sim_j_i = torch.diag(sim, -batch_size)   #B*1
+    
+        positive_samples = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
+
+        mask = self.mask_correlated_samples(batch_size)
+
+        negative_samples = sim[mask].reshape(N, -1)
+    
+        labels = torch.zeros(N).to(positive_samples.device).long()
+        logits = torch.cat((positive_samples, negative_samples), dim=1)  # N * C
+        loss = self.ce_loss(logits, labels)
+        return loss
+
+    def projection_head_map(self, state, mode):
+        for i, l in enumerate(self.projection_head):
+            if i % 2 != 0:
+                if mode == 0:
+                    l.train()
+                else:
+                    l.eval()
+            state = l(state)
+            if i % 2 != 0:
+                state = F.relu(state)
+        return state
+ 
     def calculate_loss(self, interaction):
         if self.restore_user_e is not None or self.restore_entity_e is not None:
             self.restore_user_e, self.restore_entity_e = None, None
@@ -183,6 +263,55 @@ class KGAT(KnowledgeRecommender):
         neg_item = interaction[self.NEG_ITEM_ID]
 
         user_all_embeddings, entity_all_embeddings = self.forward()
+        kgat_all_embeddings = torch.cat((user_all_embeddings, entity_all_embeddings), 0)
+        user_all_embeddings_1, entity_all_embeddings_1 = self.forward_1()
+        user_all_embeddings_2, entity_all_embeddings_2 = self.forward_2()
+
+        user_rand_samples = self.rand_sample(user_all_embeddings_1.shape[0], size=user.shape[0]//8, replace=False)
+        entity_rand_samples = self.rand_sample(entity_all_embeddings_1.shape[0], size=user.shape[0], replace=False)
+        
+
+        cts_embedding_1 = user_all_embeddings_1[torch.tensor(user_rand_samples)]
+        cts_embedding_2 = user_all_embeddings_2[torch.tensor(user_rand_samples)]
+
+        e_cts_embedding_1 = entity_all_embeddings_1[torch.tensor(entity_rand_samples)]
+        e_cts_embedding_2 = entity_all_embeddings_2[torch.tensor(entity_rand_samples)]
+
+        u_embeddings = user_all_embeddings[user]
+        pos_embeddings = entity_all_embeddings[pos_item]
+        neg_embeddings = entity_all_embeddings[neg_item]
+
+
+
+        cts_embedding_1 = self.projection_head_map(cts_embedding_1, self.mode)
+        cts_embedding_2 = self.projection_head_map(cts_embedding_2, 1 - self.mode)
+        e_cts_embedding_1 = self.projection_head_map(e_cts_embedding_1, self.mode)
+        e_cts_embedding_2 = self.projection_head_map(e_cts_embedding_2, 1 - self.mode)
+
+        u_embeddings = self.projection_head_map(u_embeddings, self.mode)
+        pos_embeddings = self.projection_head_map(pos_embeddings, 1 - self.mode)
+
+
+
+        self.mode = 1 - self.mode       
+
+        cts_loss = self.cts_loss(cts_embedding_1, cts_embedding_2, temp=1.0,
+                                                        batch_size=cts_embedding_1.shape[0])
+        e_cts_loss = self.cts_loss(e_cts_embedding_1, e_cts_embedding_2, temp=1.0,
+                                                        batch_size=e_cts_embedding_1.shape[0])
+
+        ui_cts_loss = self.cts_loss(u_embeddings, pos_embeddings, temp=1.0,
+                                                        batch_size=u_embeddings.shape[0])
+
+
+#        cts_loss_1 = self.cts_loss(cts_embedding, cts_embedding_1, temp=0.1,
+#                                                        batch_size=cts_embedding_1.shape[0])
+#        cts_loss_2 = self.cts_loss(cts_embedding, cts_embedding_2, temp=0.1,
+#                                                        batch_size=cts_embedding_1.shape[0])
+
+
+
+
         u_embeddings = user_all_embeddings[user]
         pos_embeddings = entity_all_embeddings[pos_item]
         neg_embeddings = entity_all_embeddings[neg_item]
@@ -191,8 +320,8 @@ class KGAT(KnowledgeRecommender):
         neg_scores = torch.mul(u_embeddings, neg_embeddings).sum(dim=1)
         mf_loss = self.mf_loss(pos_scores, neg_scores)
         reg_loss = self.reg_loss(u_embeddings, pos_embeddings, neg_embeddings)
-        loss = mf_loss + self.reg_weight * reg_loss
-
+        print("cts_loss:", cts_loss, e_cts_loss, ui_cts_loss)
+        loss = mf_loss + self.reg_weight * reg_loss + 0.01 * (cts_loss + e_cts_loss + ui_cts_loss) 
         return loss
 
     def calculate_kg_loss(self, interaction):
@@ -248,6 +377,21 @@ class KGAT(KnowledgeRecommender):
 
         return kg_score
 
+    def rand_sample(self, high, size=None, replace=True):
+        r"""Randomly discard some points or edges.
+
+        Args:
+            high (int): Upper limit of index value
+            size (int): Array size after sampling
+
+        Returns:
+            numpy.ndarray: Array index after sampling, shape: [size]
+        """
+
+        a = np.arange(high)
+        sample = np.random.choice(a, size=size, replace=replace)
+        return sample
+
     def update_attentive_A(self):
         r"""Update the attention matrix using the updated embedding matrix
 
@@ -268,7 +412,22 @@ class KGAT(KnowledgeRecommender):
         # Current PyTorch version does not support softmax on SparseCUDA, temporarily move to CPU to calculate softmax
         A_in = torch.sparse.FloatTensor(indices, kg_score, self.matrix_size).cpu()
         A_in = torch.sparse.softmax(A_in, dim=1).to(self.device)
+        drop_edge_1 = self.rand_sample(indices.shape[1], size=int(indices.shape[1] * 0.1), replace=False)
+        indices_1 = indices.view(-1, 2)[torch.tensor(drop_edge_1)].view(2, -1)
+        kg_score_1 = kg_score[torch.tensor(drop_edge_1)]
+        A_in_1 = torch.sparse.FloatTensor(indices_1, kg_score_1, self.matrix_size).cpu()
+        A_in_1 = torch.sparse.softmax(A_in_1, dim=1).to(self.device)
+
+        drop_edge_2 = self.rand_sample(indices.shape[1], size=int(indices.shape[1] * 0.1), replace=False)
+        indices_2 = indices.view(-1, 2)[torch.tensor(drop_edge_2)].view(2, -1)
+        kg_score_2 = kg_score[torch.tensor(drop_edge_2)]
+        A_in_2 = torch.sparse.FloatTensor(indices_2, kg_score_2, self.matrix_size).cpu()
+        A_in_2 = torch.sparse.softmax(A_in_2, dim=1).to(self.device)
+        
         self.A_in = A_in
+        self.A_in_1 = A_in_1
+        self.A_in_2 = A_in_2
+        
 
     def predict(self, interaction):
         user = interaction[self.USER_ID]
