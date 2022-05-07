@@ -295,13 +295,13 @@ class KGAT(KnowledgeRecommender):
 
         self.mode = 1 - self.mode       
 
-        cts_loss = self.cts_loss(cts_embedding_1, cts_embedding_2, temp=1.0,
-                                                        batch_size=cts_embedding_1.shape[0])
-        e_cts_loss = self.cts_loss(e_cts_embedding_1, e_cts_embedding_2, temp=1.0,
-                                                        batch_size=e_cts_embedding_1.shape[0])
+#        cts_loss = self.cts_loss(cts_embedding_1, cts_embedding_2, temp=1.0,
+#                                                        batch_size=cts_embedding_1.shape[0])
+#        e_cts_loss = self.cts_loss(e_cts_embedding_1, e_cts_embedding_2, temp=1.0,
+#                                                        batch_size=e_cts_embedding_1.shape[0])
 
-        ui_cts_loss = self.cts_loss(u_embeddings, pos_embeddings, temp=1.0,
-                                                        batch_size=u_embeddings.shape[0])
+#        ui_cts_loss = self.cts_loss(u_embeddings, pos_embeddings, temp=1.0,
+#                                                        batch_size=u_embeddings.shape[0])
 
 
 #        cts_loss_1 = self.cts_loss(cts_embedding, cts_embedding_1, temp=0.1,
@@ -320,8 +320,8 @@ class KGAT(KnowledgeRecommender):
         neg_scores = torch.mul(u_embeddings, neg_embeddings).sum(dim=1)
         mf_loss = self.mf_loss(pos_scores, neg_scores)
         reg_loss = self.reg_loss(u_embeddings, pos_embeddings, neg_embeddings)
-        print("cts_loss:", cts_loss, e_cts_loss, ui_cts_loss)
-        loss = mf_loss + self.reg_weight * reg_loss + 0.01 * (cts_loss + e_cts_loss + ui_cts_loss) 
+#        print("cts_loss:", cts_loss, e_cts_loss, ui_cts_loss)
+        loss = mf_loss + self.reg_weight * reg_loss# + 0.01 * (cts_loss + e_cts_loss + ui_cts_loss) 
         return loss
 
     def calculate_kg_loss(self, interaction):
