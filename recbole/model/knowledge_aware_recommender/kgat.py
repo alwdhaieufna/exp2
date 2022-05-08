@@ -242,12 +242,12 @@ class KGAT(KnowledgeRecommender):
         return loss
 
     def projection_head_map(self, state, mode):
-        for i, l in enumerate(self.projection_head):
+        for i, l in enumerate(self.projection_head): # 0: Linear 1: BN (relu)  2: Linear 3:BN (relu)
             if i % 2 != 0:
                 if mode == 0:
-                    l.train()
+                    l.train()   # set BN to train mode: use a learned mean and variance.
                 else:
-                    l.eval()
+                    l.eval()   # set BN to eval mode: use a accumulated mean and variance.
             state = l(state)
             if i % 2 != 0:
                 state = F.relu(state)
@@ -264,6 +264,8 @@ class KGAT(KnowledgeRecommender):
 
         user_all_embeddings, entity_all_embeddings = self.forward()
         kgat_all_embeddings = torch.cat((user_all_embeddings, entity_all_embeddings), 0)
+
+
         user_all_embeddings_1, entity_all_embeddings_1 = self.forward_1()
         user_all_embeddings_2, entity_all_embeddings_2 = self.forward_2()
 
@@ -291,12 +293,12 @@ class KGAT(KnowledgeRecommender):
         u_embeddings = self.projection_head_map(u_embeddings, self.mode)
         pos_embeddings = self.projection_head_map(pos_embeddings, 1 - self.mode)
 
-
-
         self.mode = 1 - self.mode       
+
 
         cts_loss = self.cts_loss(cts_embedding_1, cts_embedding_2, temp=1.0,
                                                         batch_size=cts_embedding_1.shape[0])
+                                                        
         e_cts_loss = self.cts_loss(e_cts_embedding_1, e_cts_embedding_2, temp=1.0,
                                                         batch_size=e_cts_embedding_1.shape[0])
 
